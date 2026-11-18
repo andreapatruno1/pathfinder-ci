@@ -1,0 +1,194 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+# Minimal permissions: the pipeline only reads the code and stores artifacts.
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '21'
+  JAVA_DISTRIBUTION: 'temurin'
+  COVERAGE_THRESHOLD: 80
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. archetype: prepares the pipeline and exports the Maven coordinates
+  # ---------------------------------------------------------------------------
+  archetype:
+    runs-on: ubuntu-22.04
+    outputs:
+      group: ${{ steps.coordinates.outputs.group }}
+      artifact: ${{ steps.coordinates.outputs.artifact }}
+      version: ${{ steps.coordinates.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+
+      - name: Verify pom.xml exists
+        run: |
+          if [ -f pom.xml ]; then
+            echo "pom.xml found"
+          else
+            echo "Error: pom.xml not found."
+            exit 1
+          fi
+
+      - name: Extract Maven coordinates
+        id: coordinates
+        run: |
+          GROUP=$(mvn -B help:evaluate -Dexpression=project.groupId -q -DforceStdout)
+          ARTIFACT=$(mvn -B help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+          VERSION=$(mvn -B help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "group=${GROUP}" >> "$GITHUB_OUTPUT"
+          echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Coordinates: ${GROUP}:${ARTIFACT}:${VERSION}"
+
+  # ---------------------------------------------------------------------------
+  # 2. build: compiles, tests, packages and stores JAR + coverage as artifacts
+  # ---------------------------------------------------------------------------
+  build:
+    runs-on: ubuntu-22.04
+    needs: archetype
+    env:
+      JAR_NAME: ${{ needs.archetype.outputs.artifact }}-${{ needs.archetype.outputs.version }}.jar
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+
+      - name: Restore Maven dependency cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: >-
+            maven-dependencies-${{ runner.os }}-${{ needs.archetype.outputs.artifact }}-${{ needs.archetype.outputs.version }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-dependencies-${{ runner.os }}-${{ needs.archetype.outputs.artifact }}-
+
+      - name: Build, test and package
+        run: mvn -B clean compile test package verify
+
+      - name: Upload JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: jar
+          path: target/${{ env.JAR_NAME }}
+          if-no-files-found: error
+
+      # Uploaded even if the build fails, so the coverage can be diagnosed.
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/site/jacoco/
+          if-no-files-found: warn
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+
+      # R3: step executed only on a push to the main branch (master)
+      - name: Release summary (master only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: |
+          {
+            echo "## Build on master"
+            echo "- Coordinates: \`${{ needs.archetype.outputs.group }}:${{ needs.archetype.outputs.artifact }}:${{ needs.archetype.outputs.version }}\`"
+            echo "- JAR: \`${JAR_NAME}\`"
+            echo "- Commit: \`${GITHUB_SHA::7}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # R3: step executed only on pull requests
+      - name: Pull request notice (PR only)
+        if: github.event_name == 'pull_request'
+        run: echo "PR #${{ github.event.pull_request.number }} built; the JAR is not published from pull requests."
+
+  # ---------------------------------------------------------------------------
+  # 3. coverage-check: reads jacoco.xml produced by build and enforces 80 %
+  # ---------------------------------------------------------------------------
+  coverage-check:
+    runs-on: ubuntu-22.04
+    needs: build
+    outputs:
+      coverage: ${{ steps.check.outputs.coverage }}
+    steps:
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+          path: ./reports
+
+      # JaCoCo XML has no <line-rate> element (that is Cobertura format).
+      # The global LINE counter is the last <counter type="LINE" .../> in the file.
+      - name: Verify coverage threshold
+        id: check
+        run: |
+          THRESHOLD=${COVERAGE_THRESHOLD}
+          COUNTER=$(grep -o '<counter type="LINE" missed="[0-9]*" covered="[0-9]*"/>' ./reports/jacoco.xml | tail -1)
+          MISSED=$(echo "$COUNTER" | sed -E 's/.*missed="([0-9]+)".*/\1/')
+          COVERED=$(echo "$COUNTER" | sed -E 's/.*covered="([0-9]+)".*/\1/')
+          COVERAGE=$(awk -v c="$COVERED" -v m="$MISSED" 'BEGIN { printf "%.2f", (c * 100) / (c + m) }')
+          echo "coverage=${COVERAGE}" >> "$GITHUB_OUTPUT"
+          echo "## Line coverage: ${COVERAGE}% (threshold ${THRESHOLD}%)" >> "$GITHUB_STEP_SUMMARY"
+          if (( $(echo "$COVERAGE < $THRESHOLD" | bc -l) )); then
+            echo "Coverage below threshold: $COVERAGE%"
+            exit 1
+          fi
+          echo "Coverage meets the threshold: $COVERAGE%"
+
+  # ---------------------------------------------------------------------------
+  # R2: test matrix over operating systems and JDK distributions
+  # ---------------------------------------------------------------------------
+  compatibility:
+    needs: archetype
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, windows-latest]
+        distribution: [temurin, corretto]
+        exclude:
+          - os: windows-latest
+            distribution: corretto
+    name: test (${{ matrix.os }}, ${{ matrix.distribution }} 21)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (${{ matrix.distribution }})
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: ${{ matrix.distribution }}
+          cache: maven
+
+      - name: Run tests
+        run: mvn -B test
