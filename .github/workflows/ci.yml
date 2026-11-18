@@ -123,7 +123,9 @@ jobs:
       # R3: step executed only on pull requests
       - name: Pull request notice (PR only)
         if: github.event_name == 'pull_request'
-        run: echo "PR #${{ github.event.pull_request.number }} built; the JAR is not published from pull requests."
+        # Block scalar (|) needed: in a plain YAML scalar " #" starts a comment.
+        run: |
+          echo "PR #${{ github.event.pull_request.number }} built; the JAR is not published from pull requests."
 
   # ---------------------------------------------------------------------------
   # 3. coverage-check: reads jacoco.xml produced by build and enforces 80 %
