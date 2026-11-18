@@ -45,6 +45,39 @@ public class GraphContainerTest {
 		);
 	}
 
+	@Test
+	void testPathWeightUnknownVertex() {
+		assertThrows(IllegalArgumentException.class, () ->
+				graphContainer.pathWeightBetween("A", "Z")
+		);
+		assertThrows(IllegalArgumentException.class, () ->
+				graphContainer.pathWeightBetween("Z", "A")
+		);
+	}
+
+	@Test
+	void testShortestPathUnknownSource() {
+		assertThrows(IllegalArgumentException.class, () ->
+				graphContainer.shortestPathBetween("Z", "A")
+		);
+	}
+
+	@Test
+	void testDisconnectedVertices() {
+		Graph<String, DefaultEdge> graph = mockGraph();
+		graph.addVertex("E");
+		GraphContainer container = new GraphContainer(graph);
+
+		assertThrows(IllegalArgumentException.class, () -> container.shortestPathBetween("A", "E"));
+		assertThrows(IllegalArgumentException.class, () -> container.pathWeightBetween("A", "E"));
+	}
+
+	@Test
+	void testPathToItself() {
+		assertEquals(java.util.List.of("A"), graphContainer.shortestPathBetween("A", "A"));
+		assertEquals(0.0, graphContainer.pathWeightBetween("A", "A"));
+	}
+
 	private GraphLoader mockGraphLoader() throws IOException {
 		GraphLoader graphLoader = mock(GraphLoader.class);
 		when(graphLoader.load()).thenReturn(new GraphContainer(mockGraph()));
